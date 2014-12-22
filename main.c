@@ -279,14 +279,15 @@ void world_chunk_init(struct world_chunk* chunk)
 	for (int x = 0; x < WORLD_CHUNK_LENGTH; x++) {
 		struct vec3i pos = {{x,y,z}};
 		struct world_cell* cell = world_chunk_cell_atp(chunk, pos);
-		cell->type = (rand()&3) == 0;
+		cell->type = (rand()&7) == 0;
 	}
 	#endif
 }
 
 
-void world_chunk_draw(struct world_chunk* chunk, struct vtxbuf* vb)
+int world_chunk_draw(struct world_chunk* chunk, struct vtxbuf* vb, struct vec3i offset)
 {
+	int quads = 0;
 	for (int z = 0; z < WORLD_CHUNK_LENGTH; z++)
 	for (int y = 0; y < WORLD_CHUNK_LENGTH; y++)
 	for (int x = 0; x < WORLD_CHUNK_LENGTH; x++) {
@@ -323,7 +324,7 @@ void world_chunk_draw(struct world_chunk* chunk, struct vtxbuf* vb)
 							} else {
 								a = ds[dsi++];
 							}
-							quad[p++] = point.s[j] + a;
+							quad[p++] = point.s[j] + a + offset.s[j] * WORLD_CHUNK_LENGTH;
 						}
 						for (int j = 0; j < 3; j++) quad[p++] = normal.s[j];
 
@@ -332,10 +333,13 @@ void world_chunk_draw(struct world_chunk* chunk, struct vtxbuf* vb)
 
 					}
 					vtxbuf_element(vb, quad, sizeof(quad));
+					quads++;
 				}
 			}
 		}
 	}
+	//printf("quads: %d\n", quads);
+	return quads;
 }
 
 int main(int argc, char** argv)
@@ -471,7 +475,16 @@ int main(int argc, char** argv)
 		shader_uniform_mat44(&shader0, "u_projection", &projection);
 		shader_uniform_mat44(&shader0, "u_view", &view);
 
-		world_chunk_draw(&chunk, &vtxbuf);
+		int min = -1;
+		int max = 1;
+		int quads = 0;
+		for (int dz = min; dz <= max; dz++)
+		for (int dy = min; dy <= max; dy++)
+		for (int dx = min; dx <= max; dx++) {
+			struct vec3i offset = {{dx,dy,dz}};
+			quads += world_chunk_draw(&chunk, &vtxbuf, offset);
+		}
+		printf("quads: %d\n", quads);
 
 		vtxbuf_end(&vtxbuf);
 
