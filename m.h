@@ -10,6 +10,9 @@
 #define DEG2RAD(x) ((x)/180.0f*M_PI)
 #define I2RAD(x) ((x)*M_PI*2.0f)
 
+#define MAX(a,b) ((a)>(b) ? (a) : (b))
+#define MIN(a,b) ((a)<(b) ? (a) : (b))
+
 float calc_bezier(float t, float a, float b, float c, float d);
 float calc_bezier_deriv(float t, float a, float b, float c, float d);
 

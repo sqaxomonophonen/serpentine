@@ -59,6 +59,59 @@ int vec3i_equals(struct vec3i* a, struct vec3i* b)
 }
 
 
+struct aabb {
+	struct vec3 min, max;
+};
+
+void aabb_init_min_max(struct aabb* aabb, struct vec3* min, struct vec3* max)
+{
+	memcpy(&aabb->min, min, sizeof(*min));
+	memcpy(&aabb->max, max, sizeof(*max));
+}
+
+void aabb_init_around(struct aabb* aabb, struct vec3* pos, struct vec3* min, struct vec3* max)
+{
+	vec3_add(&aabb->min, pos, min);
+	vec3_add(&aabb->max, pos, max);
+}
+
+int aabb_aabb_intersection(struct aabb* a, struct aabb* b)
+{
+	for (int axis = 0; axis < 3; axis++) {
+		if (a->max.s[axis] < b->min.s[axis] || a->min.s[axis] > b->max.s[axis]) return 0;
+	}
+	return 1;
+}
+
+
+int aabb_aabb_moving_intersection(struct aabb* a, struct aabb* b, struct vec3* v, float* tfirst, float* tlast)
+{
+	if (aabb_aabb_intersection(a, b)) {
+		*tfirst = 0;
+		*tlast = 0;
+		return 1;
+	}
+
+	*tfirst = 0;
+	*tlast = 1;
+
+	for (int axis = 0; axis < 3; axis++) {
+		if (b->max.s[axis] < a->min.s[axis] || b->min.s[axis] > a->max.s[axis]) {
+			return 0;
+		} else if (v->s[axis] < 0) {
+			if (a->max.s[axis] < b->min.s[axis]) *tfirst = MAX((a->max.s[axis] - b->min.s[axis]) / v->s[axis], *tfirst);
+			if (b->max.s[axis] > a->min.s[axis]) *tlast = MIN((a->min.s[axis] - b->max.s[axis]) / v->s[axis], *tlast);
+		} else if (v->s[axis] > 0) {
+			if (b->max.s[axis] < a->min.s[axis]) *tfirst = MAX((a->min.s[axis] - b->max.s[axis]) / v->s[axis], *tfirst);
+			if (a->max.s[axis] > b->min.s[axis]) *tlast = MIN((a->max.s[axis] - b->min.s[axis]) / v->s[axis], *tlast);
+		}
+		if (*tfirst > *tlast) return 0;
+	}
+
+	return 1;
+}
+
+
 #define SHADER_MAX_ATTRS (16)
 
 enum shader_attr_type {
@@ -279,11 +332,10 @@ void world_chunk_init(struct world_chunk* chunk)
 	for (int x = 0; x < WORLD_CHUNK_LENGTH; x++) {
 		struct vec3i pos = {{x,y,z}};
 		struct world_cell* cell = world_chunk_cell_atp(chunk, pos);
-		cell->type = (rand()&7) == 0;
+		cell->type = (rand()&15) == 0;
 	}
 	#endif
 }
-
 
 int world_chunk_draw(struct world_chunk* chunk, struct vtxbuf* vb, struct vec3i offset)
 {
@@ -338,8 +390,47 @@ int world_chunk_draw(struct world_chunk* chunk, struct vtxbuf* vb, struct vec3i 
 			}
 		}
 	}
-	//printf("quads: %d\n", quads);
 	return quads;
+}
+
+int world_chunk_player_clip(struct world_chunk* chunk, struct vec3* offset, struct aabb* player_aabb, struct vec3* velocity, float* tfirst, float* tlast)
+{
+	int found = 0;
+	for (int z = 0; z < WORLD_CHUNK_LENGTH; z++)
+	for (int y = 0; y < WORLD_CHUNK_LENGTH; y++)
+	for (int x = 0; x < WORLD_CHUNK_LENGTH; x++) {
+		struct vec3i ipos = {{x,y,z}};
+		struct world_cell* cell = world_chunk_cell_atp(chunk, ipos);
+		if (cell->type == 0) continue;
+		struct vec3 pos = {{x,y,z}};
+		vec3_add_scaled_inplace(&pos, offset, WORLD_CHUNK_LENGTH);
+		struct vec3 extents = {{1,1,1}};
+		struct vec3 max;
+		vec3_add(&max, &pos, &extents);
+		struct aabb cube;
+		aabb_init_min_max(&cube, &pos, &max);
+
+		#if 0
+		printf("%d %d %d\n", x, y, z);
+		vec3_dump(&pos);
+		vec3_dump(&max);
+		vec3_dump(&player_aabb->min);
+		vec3_dump(&player_aabb->max);
+		#endif
+
+		float tfirst0, tlast0;
+		if (aabb_aabb_moving_intersection(&cube, player_aabb, velocity, &tfirst0, &tlast0)) {
+			if (!found) {
+				*tfirst = tfirst0;
+				*tlast = tlast0;
+				found = 1;
+			} else {
+				if (tfirst0 < *tfirst) *tfirst = tfirst0;
+				if (tlast0 < *tlast) *tlast = tlast0;
+			}
+		}
+	}
+	return found == 1;
 }
 
 int main(int argc, char** argv)
@@ -399,10 +490,15 @@ int main(int argc, char** argv)
 
 	float yaw = 0;
 	float pitch = 0;
-	struct vec3 position = {{4,16,4}};
+	struct vec3 position = {{4,20,4}};
+	struct vec3 velocity = {{0,0,0}};
+	struct vec3 gravity = {{0,-0.001,0}};
 
 	glEnable(GL_DEPTH_TEST);
 	glEnable(GL_CULL_FACE);
+
+	int chunk_min = -1;
+	int chunk_max = 1;
 
 	SDL_SetRelativeMouseMode(SDL_TRUE);
 	int exiting = 0;
@@ -441,6 +537,31 @@ int main(int argc, char** argv)
 			 }
 		}
 
+
+
+
+		vec3_add_inplace(&velocity, &gravity);
+
+		struct vec3 player_extents_min = {{-0.4, -1.4, -0.4}};
+		struct vec3 player_extents_max = {{0.4, 0.4, 0.4}};
+
+		struct aabb player_aabb;
+		aabb_init_around(&player_aabb, &position, &player_extents_min, &player_extents_max);
+
+		for (int dz = chunk_min; dz <= chunk_max; dz++)
+		for (int dy = chunk_min; dy <= chunk_max; dy++)
+		for (int dx = chunk_min; dx <= chunk_max; dx++) {
+			struct vec3 offset = {{dx,dy,dz}};
+			float tfirst, tlast;
+			if (world_chunk_player_clip(&chunk, &offset, &player_aabb, &velocity, &tfirst, &tlast)) {
+				vec3_scale_inplace(&velocity, tfirst);
+			}
+		}
+
+		vec3_add_inplace(&position, &velocity);
+
+
+
 		{
 			float sensitivity = 0.1f;
 			yaw += (float)mdx * sensitivity;
@@ -475,12 +596,10 @@ int main(int argc, char** argv)
 		shader_uniform_mat44(&shader0, "u_projection", &projection);
 		shader_uniform_mat44(&shader0, "u_view", &view);
 
-		int min = -1;
-		int max = 1;
 		int quads = 0;
-		for (int dz = min; dz <= max; dz++)
-		for (int dy = min; dy <= max; dy++)
-		for (int dx = min; dx <= max; dx++) {
+		for (int dz = chunk_min; dz <= chunk_max; dz++)
+		for (int dy = chunk_min; dy <= chunk_max; dy++)
+		for (int dx = chunk_min; dx <= chunk_max; dx++) {
 			struct vec3i offset = {{dx,dy,dz}};
 			quads += world_chunk_draw(&chunk, &vtxbuf, offset);
 		}
