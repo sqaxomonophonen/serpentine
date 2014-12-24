@@ -10,8 +10,9 @@
 #define DEG2RAD(x) ((x)/180.0f*M_PI)
 #define I2RAD(x) ((x)*M_PI*2.0f)
 
-#define MAX(a,b) ((a)>(b) ? (a) : (b))
-#define MIN(a,b) ((a)<(b) ? (a) : (b))
+// XXX dangerous due to potential double calculation
+//#define MAX(a,b) ((a)>(b) ? (a) : (b))
+//#define MIN(a,b) ((a)<(b) ? (a) : (b))
 
 float calc_bezier(float t, float a, float b, float c, float d);
 float calc_bezier_deriv(float t, float a, float b, float c, float d);
@@ -31,6 +32,7 @@ void vec3_sub(struct vec3* dst, struct vec3* a, struct vec3* b);
 void vec3_scale_inplace(struct vec3* dst, float scalar);
 void vec3_lerp(struct vec3* dst, struct vec3* a, struct vec3* b, float t);
 float vec3_dot(struct vec3* a, struct vec3* b);
+float vec3_length(struct vec3* v);
 void vec3_cross(struct vec3* dst, struct vec3* a, struct vec3* b);
 void vec3_normalize_inplace(struct vec3* dst);
 void vec3_move(struct vec3* move, float yaw, float pitch, float forward, float right);

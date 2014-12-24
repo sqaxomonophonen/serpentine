@@ -98,6 +98,12 @@ float vec3_dot(struct vec3* a, struct vec3* b)
 	return r;
 }
 
+float vec3_length(struct vec3* v)
+{
+	return sqrtf(vec3_dot(v, v));
+}
+
+
 void vec3_cross(struct vec3* dst, struct vec3* a, struct vec3* b)
 {
 	for (int i = 0; i < 3; i++) {
@@ -109,7 +115,7 @@ void vec3_cross(struct vec3* dst, struct vec3* a, struct vec3* b)
 
 void vec3_normalize_inplace(struct vec3* dst)
 {
-	vec3_scale_inplace(dst, 1 / sqrtf(vec3_dot(dst, dst)));
+	vec3_scale_inplace(dst, 1 / vec3_length(dst));
 }
 
 void vec3_move(struct vec3* move, float yaw, float pitch, float forward, float right)

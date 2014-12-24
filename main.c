@@ -1,12 +1,16 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <math.h>
 
 #include "a.h"
 #include "m.h"
 
 #include <SDL.h>
 #include <GL/glew.h>
+
+#define GRAVITY_AXIS (1)
+#define GRAVITY_SIGN (-1)
 
 void glew_init()
 {
@@ -58,6 +62,40 @@ int vec3i_equals(struct vec3i* a, struct vec3i* b)
 	return 1;
 }
 
+void vec3i_dump(struct vec3i* v)
+{
+	printf("(%d  %d  %d)\n", v->s[0], v->s[1], v->s[2]);
+}
+
+struct vec3i_it {
+	struct vec3i current, min, max;
+	int more;
+};
+
+void vec3i_it_init(struct vec3i_it* it, struct vec3i* min, struct vec3i* max)
+{
+	it->current = *min;
+	it->min = *min;
+	it->max = *max;
+	it->more = 1;
+}
+
+void vec3i_it_next(struct vec3i_it* it)
+{
+	AN(it->more);
+	int axis = 0;
+	while (axis < 3) {
+		it->current.s[axis]++;
+		if (it->current.s[axis] > it->max.s[axis]) {
+			it->current.s[axis] = it->min.s[axis];
+			axis++;
+		} else {
+			break;
+		}
+	}
+	if (axis == 3) it->more = 0;
+}
+
 
 struct aabb {
 	struct vec3 min, max;
@@ -75,6 +113,26 @@ void aabb_init_around(struct aabb* aabb, struct vec3* pos, struct vec3* min, str
 	vec3_add(&aabb->max, pos, max);
 }
 
+void aabb_grow_inplace(struct aabb* aabb, float s)
+{
+	for (int axis = 0; axis < 3; axis++) {
+		aabb->min.s[axis] -= s;
+		aabb->max.s[axis] += s;
+	}
+}
+
+void aabb_extend_inplace(struct aabb* aabb, struct vec3* x)
+{
+	for (int axis = 0; axis < 3; axis++) {
+		float v = x->s[axis];
+		if (v < 0) {
+			aabb->min.s[axis] += v;
+		} else {
+			aabb->max.s[axis] += v;
+		}
+	}
+}
+
 int aabb_aabb_intersection(struct aabb* a, struct aabb* b)
 {
 	for (int axis = 0; axis < 3; axis++) {
@@ -83,34 +141,21 @@ int aabb_aabb_intersection(struct aabb* a, struct aabb* b)
 	return 1;
 }
 
-
-int aabb_aabb_moving_intersection(struct aabb* a, struct aabb* b, struct vec3* v, float* tfirst, float* tlast)
+void aabb_cube_at(struct aabb* aabb, struct vec3i* pos)
 {
-	if (aabb_aabb_intersection(a, b)) {
-		*tfirst = 0;
-		*tlast = 0;
-		return 1;
-	}
-
-	*tfirst = 0;
-	*tlast = 1;
-
-	for (int axis = 0; axis < 3; axis++) {
-		if (b->max.s[axis] < a->min.s[axis] || b->min.s[axis] > a->max.s[axis]) {
-			return 0;
-		} else if (v->s[axis] < 0) {
-			if (a->max.s[axis] < b->min.s[axis]) *tfirst = MAX((a->max.s[axis] - b->min.s[axis]) / v->s[axis], *tfirst);
-			if (b->max.s[axis] > a->min.s[axis]) *tlast = MIN((a->min.s[axis] - b->max.s[axis]) / v->s[axis], *tlast);
-		} else if (v->s[axis] > 0) {
-			if (b->max.s[axis] < a->min.s[axis]) *tfirst = MAX((a->min.s[axis] - b->max.s[axis]) / v->s[axis], *tfirst);
-			if (a->max.s[axis] > b->min.s[axis]) *tlast = MIN((a->max.s[axis] - b->min.s[axis]) / v->s[axis], *tlast);
-		}
-		if (*tfirst > *tlast) return 0;
-	}
-
-	return 1;
+	struct vec3 min = {{pos->s[0], pos->s[1], pos->s[2]}};
+	aabb->min = min;
+	struct vec3 max = {{min.s[0]+1, min.s[1]+1, min.s[2]+1}};
+	aabb->max = max;
 }
 
+void aabb_aabb_convolute(struct aabb* dst, struct aabb* a, struct aabb* b)
+{
+	for (int axis = 0; axis < 3; axis++) {
+		dst->min.s[axis] = b->min.s[axis] - a->max.s[axis];
+		dst->max.s[axis] = b->max.s[axis] - a->min.s[axis];
+	}
+}
 
 #define SHADER_MAX_ATTRS (16)
 
@@ -304,6 +349,8 @@ static void gl_viewport_from_sdl_window(SDL_Window* window)
 
 struct world_cell {
 	uint8_t type, _pad0, _pad1, _pad2;
+	/* TODO maybe I should cache whether each of the 6 sides of the cube is
+	 * covered? that's 6 bits */
 };
 
 struct world_chunk {
@@ -316,10 +363,14 @@ static inline int world_chunk_cell_inside(struct world_chunk* chunk, struct vec3
 	return 1;
 }
 
-static inline struct world_cell* world_chunk_cell_atp(struct world_chunk* chunk, struct vec3i position)
+static inline struct world_cell* world_chunk_cell_atp(struct world_chunk* chunk, struct vec3i* position)
 {
 	int index = 0;
-	for (int i = 0; i < 3; i++) index += position.s[i] * (1 << (WORLD_CHUNK_LENGTH_EXP*i));
+	int shift = 0;
+	for (int i = 0; i < 3; i++) {
+		index += position->s[i] * (1 << shift);
+		shift += WORLD_CHUNK_LENGTH_EXP;
+	}
 	return &chunk->cells[index];
 }
 
@@ -331,7 +382,7 @@ void world_chunk_init(struct world_chunk* chunk)
 	for (int y = 0; y < WORLD_CHUNK_LENGTH; y++)
 	for (int x = 0; x < WORLD_CHUNK_LENGTH; x++) {
 		struct vec3i pos = {{x,y,z}};
-		struct world_cell* cell = world_chunk_cell_atp(chunk, pos);
+		struct world_cell* cell = world_chunk_cell_atp(chunk, &pos);
 		cell->type = (rand()&15) == 0;
 	}
 	#endif
@@ -344,7 +395,7 @@ int world_chunk_draw(struct world_chunk* chunk, struct vtxbuf* vb, struct vec3i 
 	for (int y = 0; y < WORLD_CHUNK_LENGTH; y++)
 	for (int x = 0; x < WORLD_CHUNK_LENGTH; x++) {
 		struct vec3i pos = {{x,y,z}};
-		struct world_cell* cell = world_chunk_cell_atp(chunk, pos);
+		struct world_cell* cell = world_chunk_cell_atp(chunk, &pos);
 		if (cell->type > 0) {
 			for (int axis = 0; axis < 3; axis++) {
 				for (int sign = 0; sign < 2; sign++) {
@@ -352,7 +403,7 @@ int world_chunk_draw(struct world_chunk* chunk, struct vtxbuf* vb, struct vec3i 
 						struct vec3i nbpos = pos;
 						nbpos.s[axis] += sign ? 1 : -1;
 						if (world_chunk_cell_inside(chunk, nbpos)) {
-							struct world_cell* nbcell = world_chunk_cell_atp(chunk, nbpos);
+							struct world_cell* nbcell = world_chunk_cell_atp(chunk, &nbpos);
 							if (nbcell->type > 0) continue;
 						}
 					}
@@ -393,44 +444,296 @@ int world_chunk_draw(struct world_chunk* chunk, struct vtxbuf* vb, struct vec3i 
 	return quads;
 }
 
-int world_chunk_player_clip(struct world_chunk* chunk, struct vec3* offset, struct aabb* player_aabb, struct vec3* velocity, float* tfirst, float* tlast)
+
+struct world {
+	struct world_chunk* chunks;
+};
+
+struct entity {
+	struct vec3 position;
+	struct vec3 velocity;
+	uint32_t on_ground:1;
+	uint32_t ctrl_jump:1;
+	uint32_t ctrl_forward:1;
+	uint32_t ctrl_backward:1;
+	uint32_t ctrl_left:1;
+	uint32_t ctrl_right:1;
+	float pitch, yaw;
+};
+
+void entity_init(struct entity* entity)
 {
-	int found = 0;
-	for (int z = 0; z < WORLD_CHUNK_LENGTH; z++)
-	for (int y = 0; y < WORLD_CHUNK_LENGTH; y++)
-	for (int x = 0; x < WORLD_CHUNK_LENGTH; x++) {
-		struct vec3i ipos = {{x,y,z}};
-		struct world_cell* cell = world_chunk_cell_atp(chunk, ipos);
-		if (cell->type == 0) continue;
-		struct vec3 pos = {{x,y,z}};
-		vec3_add_scaled_inplace(&pos, offset, WORLD_CHUNK_LENGTH);
-		struct vec3 extents = {{1,1,1}};
-		struct vec3 max;
-		vec3_add(&max, &pos, &extents);
-		struct aabb cube;
-		aabb_init_min_max(&cube, &pos, &max);
+	memset(entity, 0, sizeof(*entity));
+}
 
-		#if 0
-		printf("%d %d %d\n", x, y, z);
-		vec3_dump(&pos);
-		vec3_dump(&max);
-		vec3_dump(&player_aabb->min);
-		vec3_dump(&player_aabb->max);
-		#endif
+void entity_get_aabb(struct entity* entity, struct aabb* aabb)
+{
+	struct vec3 extents_min = {{-0.4, -1.4, -0.4}};
+	struct vec3 extents_max = {{0.4, 0.4, 0.4}};
+	aabb_init_around(aabb, &entity->position, &extents_min, &extents_max);
+}
 
-		float tfirst0, tlast0;
-		if (aabb_aabb_moving_intersection(&cube, player_aabb, velocity, &tfirst0, &tlast0)) {
-			if (!found) {
-				*tfirst = tfirst0;
-				*tlast = tlast0;
-				found = 1;
-			} else {
-				if (tfirst0 < *tfirst) *tfirst = tfirst0;
-				if (tlast0 < *tlast) *tlast = tlast0;
+void world_init(struct world* world)
+{
+	int n = 3*3*3;
+	world->chunks = malloc(n * sizeof(struct world_chunk));
+	for (int i = 0; i < n; i++) {
+		world_chunk_init(&world->chunks[i]);
+	}
+}
+
+struct render {
+	SDL_Window* window;
+	struct mat44 projection;
+	struct shader shader0;
+	struct vtxbuf vtxbuf;
+};
+
+void render_update_projection(struct render* render)
+{
+	int width, height;
+	SDL_GetWindowSize(render->window, &width, &height);
+	float fovy = 65;
+	float aspect = (float)width / (float)height;
+	mat44_set_perspective(&render->projection, fovy, aspect, 0.01f, 409.6f);
+}
+
+void render_init(struct render* render, SDL_Window* window)
+{
+	render->window = window;
+	{
+		#include "shader0.glsl.inc"
+		struct shader_attr_spec specs[] = {
+			{"a_position", SHADER_ATTR_VEC3},
+			{"a_normal", SHADER_ATTR_VEC3},
+			{"a_uv", SHADER_ATTR_VEC2},
+			{NULL}
+		};
+		shader_init(&render->shader0, shader0_vert_src, shader0_frag_src, specs);
+	}
+	render_update_projection(render);
+	vtxbuf_init(&render->vtxbuf, 65536);
+}
+
+void world_draw(struct world* world, struct render* render, struct mat44* view)
+{
+	vtxbuf_begin(&render->vtxbuf, &render->shader0, GL_QUADS);
+	shader_uniform_mat44(&render->shader0, "u_projection", &render->projection);
+	shader_uniform_mat44(&render->shader0, "u_view", view);
+
+	int chunk_min = -1;
+	int chunk_max = 1;
+
+	int quads = 0;
+	int chunk_offset = 0;
+	for (int dz = chunk_min; dz <= chunk_max; dz++)
+	for (int dy = chunk_min; dy <= chunk_max; dy++)
+	for (int dx = chunk_min; dx <= chunk_max; dx++) {
+		struct world_chunk* chunk = world->chunks + (chunk_offset++);
+		struct vec3i offset = {{dx,dy,dz}};
+		quads += world_chunk_draw(chunk, &render->vtxbuf, offset);
+	}
+	printf("quads: %d\n", quads);
+
+	vtxbuf_end(&render->vtxbuf);
+}
+
+void resolve_cell_coordinates(struct vec3i* out, struct vec3* in)
+{
+	for (int axis = 0; axis < 3; axis++) {
+		out->s[axis] = (int)floorf(in->s[axis]);
+	}
+}
+
+void resolve_chunk_coordinates(struct vec3i* out, struct vec3i* in)
+{
+	for (int axis = 0; axis < 3; axis++) {
+		out->s[axis] = ((in->s[axis] + (1<<30)) >> WORLD_CHUNK_LENGTH_EXP) - (1<<(30-WORLD_CHUNK_LENGTH_EXP));
+	}
+}
+
+struct world_chunk* world_chunk_atp(struct world* world, struct vec3i* pos)
+{
+	int mul = 1;
+	int index = 0;
+	for (int axis = 0; axis < 3; axis++) {
+		int v = pos->s[axis];
+		if (v < -1 || v > 1) return NULL;
+		index += mul * (v+1);
+		mul *= 3;
+	}
+	return &world->chunks[index];
+}
+
+
+struct world_cell* world_cell_atp(struct world* world, struct vec3i* cellpos)
+{
+	struct vec3i chunkpos;
+	resolve_chunk_coordinates(&chunkpos, cellpos);
+	struct world_chunk* chunk = world_chunk_atp(world, &chunkpos);
+	if (chunk == NULL) return NULL;
+	struct vec3i chunkcellpos;
+	for (int axis = 0; axis < 3; axis++) {
+		chunkcellpos.s[axis] = cellpos->s[axis] & ((1<<WORLD_CHUNK_LENGTH_EXP)-1);
+	}
+	return world_chunk_cell_atp(chunk, &chunkcellpos);
+}
+
+void world_entity_clipmove(struct world* world, struct entity* entity, float dt)
+{
+	struct aabb selector;
+	entity_get_aabb(entity, &selector);
+	aabb_extend_inplace(&selector, &entity->velocity);
+	aabb_grow_inplace(&selector, 0.01);
+
+	struct vec3i cell_min, cell_max;
+	resolve_cell_coordinates(&cell_min, &selector.min);
+	resolve_cell_coordinates(&cell_max, &selector.max);
+
+	vec3i_dump(&cell_min);
+	vec3i_dump(&cell_max);
+
+	float move_length = vec3_length(&entity->velocity) * dt;
+	int nsteps = ceilf(move_length * 32);
+	if (nsteps < 1) nsteps = 1;
+
+	float fraction = 1.0 / (float)nsteps;
+
+	for (int i = 0; i < nsteps; i++) {
+		struct vec3 move;
+		vec3_scale(&move, &entity->velocity, fraction);
+
+		struct aabb entity_aabb;
+		entity_get_aabb(entity, &entity_aabb);
+
+		float hit_t = 1.0f;
+		int hit_axis = 0;
+		int ground_below = 0;
+
+		struct vec3i_it it;
+		for (vec3i_it_init(&it, &cell_min, &cell_max); it.more; vec3i_it_next(&it)) {
+			struct world_cell* cell = world_cell_atp(world, &it.current);
+			if (cell == NULL) continue;
+			if (cell->type == 0) continue;
+
+			struct aabb cube;
+			aabb_cube_at(&cube, &it.current);
+
+			struct aabb block;
+			aabb_aabb_convolute(&block, &entity_aabb, &cube);
+
+			int ground_check = 0;
+			float tin = 0.0f;
+			float tout = 1.0f;
+
+			int axis;
+			int axis_in = 0;
+			for (axis = 0; axis < 3; axis++) {
+				float block_min = block.min.s[axis];
+				float block_max = block.max.s[axis];
+
+				{
+					// ground check
+					float epsilon = GRAVITY_SIGN * 0.01;
+					if ((axis != GRAVITY_AXIS && block_min < 0 && block_max > 0) || (axis == GRAVITY_AXIS && block_max > epsilon && block_min < epsilon)) {
+						ground_check++;
+					}
+				}
+
+				float ms = move.s[axis];
+
+				if (ms > 0) {
+					if (block_max < 0) break;
+					if (block_min > 0) {
+						float t = block_min / ms;
+						if (t > tin) {
+							tin = t;
+							axis_in = axis;
+						}
+					}
+					if (block_max > 0) {
+						tout = fmin(tout, block_max / ms);
+					}
+				} else if (ms < 0) {
+					if (block_min > 0) break;
+					if (block_max < 0) {
+						float t = block_max / ms;
+						if (t > tin) {
+							tin = t;
+							axis_in = axis;
+						}
+					}
+					if (block_min < 0) {
+						tout = fmin(tout, block_min / ms);
+					}
+				} else if (block_min > 0 || block_max < 0) {
+					break;
+				}
+
+				if (tin > tout) break;
 			}
+
+			if (ground_check == 3) ground_below++;
+
+			if (axis == 3) { // collision on all axes
+				if (tin < hit_t && tin >= 0) {
+					hit_t = tin;
+					hit_axis = axis_in;
+				}
+			}
+
+			//if (ground_check == 3) ground_below++;
+		}
+
+		if (hit_t < 1.0f) {
+			entity->velocity.s[hit_axis] = 0;
+		}
+
+		if ((ground_below && entity->velocity.s[GRAVITY_AXIS] == 0) || (hit_t < 1.0f && hit_axis == GRAVITY_AXIS)) {
+			entity->on_ground = 1;
+		}
+
+		vec3_add_scaled_inplace(&entity->position, &move, hit_t);
+
+		float fwd = entity->ctrl_forward + (entity->ctrl_backward*-1);
+		float sid = entity->ctrl_left + (entity->ctrl_right*-1);
+
+		if (entity->on_ground) {
+			if (entity->ctrl_jump) {
+				entity->on_ground = 0;
+				entity->ctrl_jump = 0;
+				//entity->velocity.s[GRAVITY_AXIS] = -1 * GRAVITY_SIGN * 100;
+				entity->velocity.s[GRAVITY_AXIS] = 0.05;
+				entity->position.s[GRAVITY_AXIS] += 0.1;
+			} else {
+				float fdt = dt * fraction;
+
+				float c = cosf(DEG2RAD(entity->yaw));
+				float s = sinf(DEG2RAD(entity->yaw));
+				float acceleration_magnitude = 0.001;
+				float acceleration = powf(acceleration_magnitude, fdt);
+
+				entity->velocity.s[0] += acceleration * (-s * fwd + c * sid);
+				entity->velocity.s[2] += acceleration * (c * fwd + s * sid);
+
+				//printf("%f %f %f\n", acceleration, fwd, sid);
+
+				float friction_magnitude = 0.0005;
+				float ground_friction = powf(friction_magnitude, fdt);
+				for (int axis = 0; axis < 3; axis++) {
+					if (axis == GRAVITY_AXIS) continue;
+					entity->velocity.s[axis] *= ground_friction;
+				}
+			}
+		} else {
+			// TODO air control
 		}
 	}
-	return found == 1;
+}
+
+void entity_apply_gravity(struct entity* entity, float gravity)
+{
+	entity->velocity.s[GRAVITY_AXIS] += GRAVITY_SIGN * gravity;
 }
 
 int main(int argc, char** argv)
@@ -456,49 +759,29 @@ int main(int argc, char** argv)
 
 	gl_viewport_from_sdl_window(window);
 
-	struct mat44 projection;
-	{
-		int width, height;
-		SDL_GetWindowSize(window, &width, &height);
-		float fovy = 65;
-		float aspect = (float)width / (float)height;
-		mat44_set_perspective(&projection, fovy, aspect, 0.01f, 409.6f);
-	}
+	struct render render;
+	render_init(&render, window);
 
-	struct vtxbuf vtxbuf;
-	vtxbuf_init(&vtxbuf, 65536);
-
-	struct world_chunk chunk;
-	world_chunk_init(&chunk);
-
-	struct shader shader0;
-	{
-		#include "shader0.glsl.inc"
-		struct shader_attr_spec specs[] = {
-			{"a_position", SHADER_ATTR_VEC3},
-			{"a_normal", SHADER_ATTR_VEC3},
-			{"a_uv", SHADER_ATTR_VEC2},
-			{NULL}
-		};
-		shader_init(&shader0, shader0_vert_src, shader0_frag_src, specs);
-	}
+	struct world world;
+	world_init(&world);
 
 	int ctrl_forward = 0;
 	int ctrl_backward = 0;
 	int ctrl_left = 0;
 	int ctrl_right = 0;
+	int ctrl_jump = 0;
 
-	float yaw = 0;
-	float pitch = 0;
-	struct vec3 position = {{4,20,4}};
-	struct vec3 velocity = {{0,0,0}};
-	struct vec3 gravity = {{0,-0.001,0}};
+	struct entity player;
+	entity_init(&player);
+	{
+		struct vec3 ppos = {{4.5,20,3.5}};
+		player.position = ppos;
+	}
 
 	glEnable(GL_DEPTH_TEST);
 	glEnable(GL_CULL_FACE);
 
-	int chunk_min = -1;
-	int chunk_max = 1;
+	float dt = 1.0 / 6.0;
 
 	SDL_SetRelativeMouseMode(SDL_TRUE);
 	int exiting = 0;
@@ -517,6 +800,7 @@ int main(int argc, char** argv)
 				 {SDLK_s, &ctrl_backward},
 				 {SDLK_a, &ctrl_left},
 				 {SDLK_d, &ctrl_right},
+				 {SDLK_SPACE, &ctrl_jump},
 				 {-1, NULL}
 			 };
 			 for (struct push_key* tkp = push_keys; tkp->intptr != NULL; tkp++) {
@@ -537,40 +821,29 @@ int main(int argc, char** argv)
 			 }
 		}
 
-
-
-
-		vec3_add_inplace(&velocity, &gravity);
-
-		struct vec3 player_extents_min = {{-0.4, -1.4, -0.4}};
-		struct vec3 player_extents_max = {{0.4, 0.4, 0.4}};
-
-		struct aabb player_aabb;
-		aabb_init_around(&player_aabb, &position, &player_extents_min, &player_extents_max);
-
-		for (int dz = chunk_min; dz <= chunk_max; dz++)
-		for (int dy = chunk_min; dy <= chunk_max; dy++)
-		for (int dx = chunk_min; dx <= chunk_max; dx++) {
-			struct vec3 offset = {{dx,dy,dz}};
-			float tfirst, tlast;
-			if (world_chunk_player_clip(&chunk, &offset, &player_aabb, &velocity, &tfirst, &tlast)) {
-				vec3_scale_inplace(&velocity, tfirst);
+		{
+			if (!player.on_ground) {
+				entity_apply_gravity(&player, 0.001);
 			}
+			player.ctrl_forward = ctrl_forward;
+			player.ctrl_backward = ctrl_backward;
+			player.ctrl_left = ctrl_left;
+			player.ctrl_right = ctrl_right;
+			player.ctrl_jump = ctrl_jump;
+			world_entity_clipmove(&world, &player, dt);
+			vec3_dump(&player.velocity);
 		}
-
-		vec3_add_inplace(&position, &velocity);
-
-
 
 		{
 			float sensitivity = 0.1f;
-			yaw += (float)mdx * sensitivity;
-			pitch += (float)mdy * sensitivity;
+			player.yaw += (float)mdx * sensitivity;
+			player.pitch += (float)mdy * sensitivity;
 			float pitch_limit = 90;
-			if (pitch > pitch_limit) pitch = pitch_limit;
-			if (pitch < -pitch_limit) pitch = -pitch_limit;
+			if (player.pitch > pitch_limit) player.pitch = pitch_limit;
+			if (player.pitch < -pitch_limit) player.pitch = -pitch_limit;
 		}
 
+		#if 0 // fly-code
 		{
 			float speed = 0.1f;
 			float forward = (float)(ctrl_forward - ctrl_backward) * speed;
@@ -579,33 +852,25 @@ int main(int argc, char** argv)
 			vec3_move(&movement, yaw, pitch, forward, right);
 			vec3_add_inplace(&position, &movement);
 		}
+		#endif
 
 		struct mat44 view;
 		mat44_set_identity(&view);
-		mat44_rotate_x(&view, pitch);
-		mat44_rotate_y(&view, yaw);
+		mat44_rotate_x(&view, player.pitch);
+		mat44_rotate_y(&view, player.yaw);
 
 		struct vec3 translate;
-		vec3_scale(&translate, &position, -1);
+		vec3_scale(&translate, &player.position, -1);
 		mat44_translate(&view, &translate);
 
-		glClearColor(0.0, 0.0, 0.2, 1.0);
+		if (player.on_ground) {
+			glClearColor(0.6, 0.0, 0.2, 1.0);
+		} else {
+			glClearColor(0.0, 0.0, 0.2, 1.0);
+		}
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-		vtxbuf_begin(&vtxbuf, &shader0, GL_QUADS);
-		shader_uniform_mat44(&shader0, "u_projection", &projection);
-		shader_uniform_mat44(&shader0, "u_view", &view);
-
-		int quads = 0;
-		for (int dz = chunk_min; dz <= chunk_max; dz++)
-		for (int dy = chunk_min; dy <= chunk_max; dy++)
-		for (int dx = chunk_min; dx <= chunk_max; dx++) {
-			struct vec3i offset = {{dx,dy,dz}};
-			quads += world_chunk_draw(&chunk, &vtxbuf, offset);
-		}
-		printf("quads: %d\n", quads);
-
-		vtxbuf_end(&vtxbuf);
+		world_draw(&world, &render, &view);
 
 		SDL_GL_SwapWindow(window);
 	}
