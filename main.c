@@ -348,9 +348,8 @@ static void gl_viewport_from_sdl_window(SDL_Window* window)
 #define WORLD_CHUNK_VOLUME (1 << (WORLD_CHUNK_LENGTH_EXP * 3))
 
 struct world_cell {
-	uint8_t type, _pad0, _pad1, _pad2;
-	/* TODO maybe I should cache whether each of the 6 sides of the cube is
-	 * covered? that's 6 bits */
+	uint8_t type;
+	uint8_t _pad0, _pad1, _pad2;
 };
 
 struct world_chunk {
@@ -372,20 +371,6 @@ static inline struct world_cell* world_chunk_cell_atp(struct world_chunk* chunk,
 		shift += WORLD_CHUNK_LENGTH_EXP;
 	}
 	return &chunk->cells[index];
-}
-
-void world_chunk_init(struct world_chunk* chunk)
-{
-	memset(chunk, 0, sizeof(*chunk));
-	#if 1
-	for (int z = 0; z < WORLD_CHUNK_LENGTH; z++)
-	for (int y = 0; y < WORLD_CHUNK_LENGTH; y++)
-	for (int x = 0; x < WORLD_CHUNK_LENGTH; x++) {
-		struct vec3i pos = {{x,y,z}};
-		struct world_cell* cell = world_chunk_cell_atp(chunk, &pos);
-		cell->type = (rand()&15) == 0;
-	}
-	#endif
 }
 
 int world_chunk_draw(struct world_chunk* chunk, struct vtxbuf* vb, struct vec3i offset)
@@ -473,15 +458,6 @@ void entity_get_aabb(struct entity* entity, struct aabb* aabb)
 	aabb_init_around(aabb, &entity->position, &extents_min, &extents_max);
 }
 
-void world_init(struct world* world)
-{
-	int n = 3*3*3;
-	world->chunks = malloc(n * sizeof(struct world_chunk));
-	for (int i = 0; i < n; i++) {
-		world_chunk_init(&world->chunks[i]);
-	}
-}
-
 struct render {
 	SDL_Window* window;
 	struct mat44 projection;
@@ -533,7 +509,7 @@ void world_draw(struct world* world, struct render* render, struct mat44* view)
 		struct vec3i offset = {{dx,dy,dz}};
 		quads += world_chunk_draw(chunk, &render->vtxbuf, offset);
 	}
-	printf("quads: %d\n", quads);
+	//printf("quads: %d\n", quads);
 
 	vtxbuf_end(&render->vtxbuf);
 }
@@ -579,8 +555,42 @@ struct world_cell* world_cell_atp(struct world* world, struct vec3i* cellpos)
 	return world_chunk_cell_atp(chunk, &chunkcellpos);
 }
 
+
+void world_chunk_init(struct world_chunk* chunk)
+{
+	memset(chunk, 0, sizeof(*chunk));
+	#if 1
+	for (int z = 0; z < WORLD_CHUNK_LENGTH; z++)
+	for (int y = 0; y < WORLD_CHUNK_LENGTH; y++)
+	for (int x = 0; x < WORLD_CHUNK_LENGTH; x++) {
+		struct vec3i pos = {{x,y,z}};
+		struct world_cell* cell = world_chunk_cell_atp(chunk, &pos);
+		cell->type = (rand()&7) == 0;
+	}
+	#endif
+}
+
+void world_init(struct world* world)
+{
+	srand(3);
+
+	int n = 3*3*3;
+	world->chunks = malloc(n * sizeof(struct world_chunk));
+	for (int i = 0; i < n; i++) {
+		world_chunk_init(&world->chunks[i]);
+	}
+}
+
 void world_entity_clipmove(struct world* world, struct entity* entity, float dt)
 {
+	float move_length = vec3_length(&entity->velocity) * dt;
+	int nsteps = ceilf(move_length * 32);
+	if (nsteps < 1) nsteps = 1;
+
+	float fraction = 1.0 / (float)nsteps;
+	struct vec3 move;
+	vec3_scale(&move, &entity->velocity, fraction);
+
 	struct aabb selector;
 	entity_get_aabb(entity, &selector);
 	aabb_extend_inplace(&selector, &entity->velocity);
@@ -590,25 +600,10 @@ void world_entity_clipmove(struct world* world, struct entity* entity, float dt)
 	resolve_cell_coordinates(&cell_min, &selector.min);
 	resolve_cell_coordinates(&cell_max, &selector.max);
 
-	vec3i_dump(&cell_min);
-	vec3i_dump(&cell_max);
-
-	float move_length = vec3_length(&entity->velocity) * dt;
-	int nsteps = ceilf(move_length * 32);
-	if (nsteps < 1) nsteps = 1;
-
-	float fraction = 1.0 / (float)nsteps;
+	int ground_collision = 0;
 
 	for (int i = 0; i < nsteps; i++) {
-		struct vec3 move;
-		vec3_scale(&move, &entity->velocity, fraction);
-
-		struct aabb entity_aabb;
-		entity_get_aabb(entity, &entity_aabb);
-
-		float hit_t = 1.0f;
-		int hit_axis = 0;
-		int ground_below = 0;
+		vec3_add_inplace(&entity->position, &move);
 
 		struct vec3i_it it;
 		for (vec3i_it_init(&it, &cell_min, &cell_max); it.more; vec3i_it_next(&it)) {
@@ -616,118 +611,79 @@ void world_entity_clipmove(struct world* world, struct entity* entity, float dt)
 			if (cell == NULL) continue;
 			if (cell->type == 0) continue;
 
+			struct aabb entity_aabb;
+			entity_get_aabb(entity, &entity_aabb);
+
 			struct aabb cube;
 			aabb_cube_at(&cube, &it.current);
 
 			struct aabb block;
 			aabb_aabb_convolute(&block, &entity_aabb, &cube);
 
-			int ground_check = 0;
-			float tin = 0.0f;
-			float tout = 1.0f;
-
-			int axis;
-			int axis_in = 0;
+			int axis = 0;
+			int exit_axis = 0;
+			float exit_distance = 1e6;
+			int exits = 0;
 			for (axis = 0; axis < 3; axis++) {
-				float block_min = block.min.s[axis];
-				float block_max = block.max.s[axis];
-
-				{
-					// ground check
-					float epsilon = GRAVITY_SIGN * 0.01;
-					if ((axis != GRAVITY_AXIS && block_min < 0 && block_max > 0) || (axis == GRAVITY_AXIS && block_max > epsilon && block_min < epsilon)) {
-						ground_check++;
+				if (block.min.s[axis] > 0 || block.max.s[axis] < 0) break;
+				for (int sign = 0; sign < 2; sign++) {
+					struct vec3i neighbour_pos = it.current;
+					neighbour_pos.s[axis] += (sign == 0) ? -1 : 1;
+					struct world_cell* neighbour = world_cell_atp(world, &neighbour_pos);
+					if (neighbour != NULL && neighbour->type != 0) continue;
+					exits++;
+					float d = (sign == 0) ? block.min.s[axis] : block.max.s[axis];
+					if (fabsf(d) < fabs(exit_distance)) {
+						exit_distance = d;
+						exit_axis = axis;
 					}
-				}
-
-				float ms = move.s[axis];
-
-				if (ms > 0) {
-					if (block_max < 0) break;
-					if (block_min > 0) {
-						float t = block_min / ms;
-						if (t > tin) {
-							tin = t;
-							axis_in = axis;
-						}
-					}
-					if (block_max > 0) {
-						tout = fmin(tout, block_max / ms);
-					}
-				} else if (ms < 0) {
-					if (block_min > 0) break;
-					if (block_max < 0) {
-						float t = block_max / ms;
-						if (t > tin) {
-							tin = t;
-							axis_in = axis;
-						}
-					}
-					if (block_min < 0) {
-						tout = fmin(tout, block_min / ms);
-					}
-				} else if (block_min > 0 || block_max < 0) {
-					break;
-				}
-
-				if (tin > tout) break;
-			}
-
-			if (ground_check == 3) ground_below++;
-
-			if (axis == 3) { // collision on all axes
-				if (tin < hit_t && tin >= 0) {
-					hit_t = tin;
-					hit_axis = axis_in;
 				}
 			}
 
-			//if (ground_check == 3) ground_below++;
-		}
+			if (axis != 3 || !exits) continue;
+			if (fabsf(exit_distance) > 2*vec3_length(&move)) continue; // XXX isn't this a hack?
 
-		if (hit_t < 1.0f) {
-			entity->velocity.s[hit_axis] = 0;
-		}
+			entity->position.s[exit_axis] += exit_distance;
+			entity->velocity.s[exit_axis] = 0;
+			move.s[exit_axis] = 0;
 
-		if ((ground_below && entity->velocity.s[GRAVITY_AXIS] == 0) || (hit_t < 1.0f && hit_axis == GRAVITY_AXIS)) {
-			entity->on_ground = 1;
-		}
-
-		vec3_add_scaled_inplace(&entity->position, &move, hit_t);
-
-		float fwd = entity->ctrl_forward + (entity->ctrl_backward*-1);
-		float sid = entity->ctrl_left + (entity->ctrl_right*-1);
-
-		if (entity->on_ground) {
-			if (entity->ctrl_jump) {
-				entity->on_ground = 0;
-				entity->ctrl_jump = 0;
-				//entity->velocity.s[GRAVITY_AXIS] = -1 * GRAVITY_SIGN * 100;
-				entity->velocity.s[GRAVITY_AXIS] = 0.05;
-				entity->position.s[GRAVITY_AXIS] += 0.1;
-			} else {
-				float fdt = dt * fraction;
-
-				float c = cosf(DEG2RAD(entity->yaw));
-				float s = sinf(DEG2RAD(entity->yaw));
-				float acceleration_magnitude = 0.001;
-				float acceleration = powf(acceleration_magnitude, fdt);
-
-				entity->velocity.s[0] += acceleration * (-s * fwd + c * sid);
-				entity->velocity.s[2] += acceleration * (c * fwd + s * sid);
-
-				//printf("%f %f %f\n", acceleration, fwd, sid);
-
-				float friction_magnitude = 0.0005;
-				float ground_friction = powf(friction_magnitude, fdt);
-				for (int axis = 0; axis < 3; axis++) {
-					if (axis == GRAVITY_AXIS) continue;
-					entity->velocity.s[axis] *= ground_friction;
-				}
+			if (exit_axis == GRAVITY_AXIS && ((exit_distance * GRAVITY_SIGN) <= 0)) {
+				ground_collision++;
 			}
+		}
+	}
+
+	entity->on_ground = ground_collision > 0;
+
+	// planar control
+	float fwd = (entity->ctrl_forward*-1) + entity->ctrl_backward;
+	float sid = (entity->ctrl_left*-1) + entity->ctrl_right;
+	float c = cosf(DEG2RAD(entity->yaw));
+	float s = sinf(DEG2RAD(entity->yaw));
+	float fdt = dt * fraction;
+
+	if (entity->on_ground) {
+		if (entity->ctrl_jump) {
+			entity->on_ground = 0;
+			entity->velocity.s[GRAVITY_AXIS] = -0.075 * GRAVITY_SIGN;
+			entity->ctrl_jump = 0;
 		} else {
-			// TODO air control
+			float acceleration = 0.2 * fdt;
+
+			entity->velocity.s[0] += acceleration * (-s * fwd + c * sid);
+			entity->velocity.s[2] += acceleration * (c * fwd + s * sid);
+
+			float friction_magnitude = 0.1;
+			float ground_friction = powf(friction_magnitude, fdt);
+			for (int axis = 0; axis < 3; axis++) {
+				if (axis == GRAVITY_AXIS) continue;
+				entity->velocity.s[axis] *= ground_friction;
+			}
 		}
+	} else {
+		float acceleration = 3e-3 * fdt;
+		entity->velocity.s[0] += acceleration * (-s * fwd + c * sid);
+		entity->velocity.s[2] += acceleration * (c * fwd + s * sid);
 	}
 }
 
@@ -822,16 +778,14 @@ int main(int argc, char** argv)
 		}
 
 		{
-			if (!player.on_ground) {
-				entity_apply_gravity(&player, 0.001);
-			}
+			entity_apply_gravity(&player, 0.001);
 			player.ctrl_forward = ctrl_forward;
 			player.ctrl_backward = ctrl_backward;
 			player.ctrl_left = ctrl_left;
 			player.ctrl_right = ctrl_right;
 			player.ctrl_jump = ctrl_jump;
 			world_entity_clipmove(&world, &player, dt);
-			vec3_dump(&player.velocity);
+			//vec3_dump(&player.velocity);
 		}
 
 		{
