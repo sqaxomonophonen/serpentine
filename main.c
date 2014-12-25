@@ -11,6 +11,8 @@
 
 #define GRAVITY_AXIS (1)
 #define GRAVITY_SIGN (-1)
+#define GRAVITY_FORCE (0.18)
+#define JUMP_HEIGHT (1.1)
 
 void glew_init()
 {
@@ -453,7 +455,7 @@ void entity_init(struct entity* entity)
 
 void entity_get_aabb(struct entity* entity, struct aabb* aabb)
 {
-	struct vec3 extents_min = {{-0.4, -1.4, -0.4}};
+	struct vec3 extents_min = {{-0.4, -0.4, -0.4}};
 	struct vec3 extents_max = {{0.4, 0.4, 0.4}};
 	aabb_init_around(aabb, &entity->position, &extents_min, &extents_max);
 }
@@ -665,15 +667,16 @@ void world_entity_clipmove(struct world* world, struct entity* entity, float dt)
 	if (entity->on_ground) {
 		if (entity->ctrl_jump) {
 			entity->on_ground = 0;
-			entity->velocity.s[GRAVITY_AXIS] = -0.075 * GRAVITY_SIGN;
+			entity->velocity.s[GRAVITY_AXIS] = -GRAVITY_SIGN * 2.0f * sqrtf(GRAVITY_FORCE * dt * JUMP_HEIGHT);
+			//entity->velocity.s[GRAVITY_AXIS] = -0.15 * GRAVITY_SIGN;
 			entity->ctrl_jump = 0;
 		} else {
-			float acceleration = 0.2 * fdt;
+			float acceleration = 1.0 * fdt;
 
 			entity->velocity.s[0] += acceleration * (-s * fwd + c * sid);
 			entity->velocity.s[2] += acceleration * (c * fwd + s * sid);
 
-			float friction_magnitude = 0.1;
+			float friction_magnitude = 0.0002;
 			float ground_friction = powf(friction_magnitude, fdt);
 			for (int axis = 0; axis < 3; axis++) {
 				if (axis == GRAVITY_AXIS) continue;
@@ -681,7 +684,7 @@ void world_entity_clipmove(struct world* world, struct entity* entity, float dt)
 			}
 		}
 	} else {
-		float acceleration = 3e-3 * fdt;
+		float acceleration = 1e-1 * fdt;
 		entity->velocity.s[0] += acceleration * (-s * fwd + c * sid);
 		entity->velocity.s[2] += acceleration * (c * fwd + s * sid);
 	}
@@ -737,7 +740,7 @@ int main(int argc, char** argv)
 	glEnable(GL_DEPTH_TEST);
 	glEnable(GL_CULL_FACE);
 
-	float dt = 1.0 / 6.0;
+	float dt = 1.0 / 60.0;
 
 	SDL_SetRelativeMouseMode(SDL_TRUE);
 	int exiting = 0;
@@ -778,7 +781,7 @@ int main(int argc, char** argv)
 		}
 
 		{
-			entity_apply_gravity(&player, 0.001);
+			entity_apply_gravity(&player, GRAVITY_FORCE * dt);
 			player.ctrl_forward = ctrl_forward;
 			player.ctrl_backward = ctrl_backward;
 			player.ctrl_left = ctrl_left;
