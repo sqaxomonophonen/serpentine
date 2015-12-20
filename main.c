@@ -471,6 +471,9 @@ void render_update_projection(struct render* render)
 {
 	int width, height;
 	SDL_GetWindowSize(render->window, &width, &height);
+
+	gl_viewport_from_sdl_window(render->window);
+
 	float fovy = 65;
 	float aspect = (float)width / (float)height;
 	mat44_set_perspective(&render->projection, fovy, aspect, 0.01f, 409.6f);
@@ -489,12 +492,13 @@ void render_init(struct render* render, SDL_Window* window)
 		};
 		shader_init(&render->shader0, shader0_vert_src, shader0_frag_src, specs);
 	}
-	render_update_projection(render);
 	vtxbuf_init(&render->vtxbuf, 65536);
 }
 
 void world_draw(struct world* world, struct render* render, struct mat44* view)
 {
+	render_update_projection(render);
+
 	vtxbuf_begin(&render->vtxbuf, &render->shader0, GL_QUADS);
 	shader_uniform_mat44(&render->shader0, "u_projection", &render->projection);
 	shader_uniform_mat44(&render->shader0, "u_view", view);
@@ -700,7 +704,7 @@ int main(int argc, char** argv)
 	SAZ(SDL_Init(SDL_INIT_VIDEO));
 	atexit(SDL_Quit);
 
-	int bitmask = SDL_WINDOW_FULLSCREEN_DESKTOP | SDL_WINDOW_OPENGL;
+	int bitmask = SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL;
 	SDL_Window* window = SDL_CreateWindow(
 			"??? ???",
 			SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
@@ -715,8 +719,6 @@ int main(int argc, char** argv)
 	SAZ(SDL_GL_SetSwapInterval(1)); // or -1, "late swap tearing"?
 
 	glew_init();
-
-	gl_viewport_from_sdl_window(window);
 
 	struct render render;
 	render_init(&render, window);
