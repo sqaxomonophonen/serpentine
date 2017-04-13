@@ -1,0 +1,29 @@
+CC=emcc
+#OPT=-Ofast
+OPT=-O2
+EMOPT=-s WASM=1 -s USE_SDL=2
+CFLAGS=--std=c99 $(EMOPT)
+LINK=$(EMOPT)
+GLSL2INC=./glsl2inc.pl
+
+all: main.html
+
+a.o: a.c
+	$(CC) $(CFLAGS) -c $<
+
+m.o: m.c
+	$(CC) $(CFLAGS) -c $<
+
+shader0.glsl.inc: shader0.vert.glsl shader0.frag.glsl
+	$(GLSL2INC) shader0 shader0.glsl.inc shader0.vert.glsl shader0.frag.glsl
+
+main.o: main.c shader0.glsl.inc
+	$(CC) $(CFLAGS) -c $<
+
+main.html: main.o a.o m.o
+	$(CC) $^ -o $@ $(LINK)
+
+clean:
+	rm -rf *.o *.glsl.inc main.html
+
+

@@ -3,11 +3,18 @@
 #include <stdio.h>
 #include <math.h>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#include <SDL.h>
+#include <GL/glew.h>
+#else
+#include <SDL.h>
+#include <GL/glew.h>
+#endif
+
 #include "a.h"
 #include "m.h"
 
-#include <SDL.h>
-#include <GL/glew.h>
 
 #define GRAVITY_AXIS (1)
 #define GRAVITY_SIGN (-1)
@@ -21,6 +28,7 @@ void glew_init()
 		arghf("glewInit() failed: %s", glewGetErrorString(err));
 	}
 
+#ifndef __EMSCRIPTEN__
 #define CHECK_GL_EXT(x) { if(!GLEW_ ## x) arghf("OpenGL extension not found: " #x); }
 	CHECK_GL_EXT(ARB_shader_objects);
 	CHECK_GL_EXT(ARB_vertex_shader);
@@ -28,6 +36,7 @@ void glew_init()
 	CHECK_GL_EXT(ARB_framebuffer_object);
 	CHECK_GL_EXT(ARB_vertex_buffer_object);
 #undef CHECK_GL_EXT
+#endif
 
 	/* to figure out what extension something belongs to, see:
 	 * http://www.opengl.org/registry/#specfiles */
@@ -35,6 +44,7 @@ void glew_init()
 	// XXX check that version is at least 1.30?
 	printf("GLSL version %s\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
 
+#ifndef __EMSCRIPTEN__
 	GLint value;
 #define DUMP_GL_INT(x) { glGetIntegerv(x, &value); printf(#x " = %d\n", value); }
 	DUMP_GL_INT(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS_ARB);
@@ -49,6 +59,9 @@ void glew_init()
 	DUMP_GL_INT(GL_MAX_DRAW_BUFFERS);
 	DUMP_GL_INT(GL_STENCIL_BITS);
 #undef DUMP_GL_INT
+#endif
+
+	CHKGL;
 }
 
 
@@ -194,8 +207,8 @@ struct shader {
 static GLuint create_shader(GLenum type, const char* src)
 {
 	GLuint shader = glCreateShader(type); CHKGL;
-	glShaderSource(shader, 1, &src, 0);
-	glCompileShader(shader);
+	glShaderSource(shader, 1, &src, 0); CHKGL;
+	glCompileShader(shader); CHKGL;
 
 	GLint status;
 	glGetShaderiv(shader, GL_COMPILE_STATUS, &status);
@@ -320,7 +333,7 @@ void vtxbuf_flush(struct vtxbuf* vb)
 
 	shader_set_attrib_pointers(vb->shader);
 	glBindBuffer(GL_ARRAY_BUFFER, vb->buffer); CHKGL;
-	glDrawArrays(vb->mode, 0, vb->used / vb->shader->stride);
+	glDrawArrays(vb->mode, 0, vb->used / vb->shader->stride); CHKGL;
 	vb->used = 0;
 }
 
@@ -422,7 +435,19 @@ int world_chunk_draw(struct world_chunk* chunk, struct vtxbuf* vb, struct vec3i 
 						for (int j = 0; j < 2; j++) quad[p++] = uv[j];
 
 					}
-					vtxbuf_element(vb, quad, sizeof(quad));
+
+					// OpenGL ES2 doesn't support GL_QUAD; converting quads to triangles
+					int t2q[2][3] = {{0,1,2},{0,2,3}};
+					for (int tri_index = 0; tri_index < 2; tri_index++) {
+						float tri[8*3];
+						for (int vert_index = 0; vert_index < 3; vert_index++) {
+							for (int k = 0; k < 8; k++) {
+								tri[vert_index * 8 + k] = quad[t2q[tri_index][vert_index] * 8 + k];
+							}
+						}
+						vtxbuf_element(vb, tri, sizeof(tri));
+					}
+
 					quads++;
 				}
 			}
@@ -492,14 +517,14 @@ void render_init(struct render* render, SDL_Window* window)
 		};
 		shader_init(&render->shader0, shader0_vert_src, shader0_frag_src, specs);
 	}
-	vtxbuf_init(&render->vtxbuf, 65536);
+	vtxbuf_init(&render->vtxbuf, 1<<19);
 }
 
 void world_draw(struct world* world, struct render* render, struct mat44* view)
 {
 	render_update_projection(render);
 
-	vtxbuf_begin(&render->vtxbuf, &render->shader0, GL_QUADS);
+	vtxbuf_begin(&render->vtxbuf, &render->shader0, GL_TRIANGLES);
 	shader_uniform_mat44(&render->shader0, "u_projection", &render->projection);
 	shader_uniform_mat44(&render->shader0, "u_view", view);
 
@@ -699,142 +724,156 @@ void entity_apply_gravity(struct entity* entity, float gravity)
 	entity->velocity.s[GRAVITY_AXIS] += GRAVITY_SIGN * gravity;
 }
 
+struct {
+	struct render render;
+	struct world world;
+	struct entity player;
+	int ctrl_forward;
+	int ctrl_backward;
+	int ctrl_left;
+	int ctrl_right;
+	int ctrl_jump;
+	float dt;
+	SDL_Window* window;
+	int exiting;
+} G;
+
+void one_frame()
+{
+	SDL_Event e;
+	int mdx = 0;
+	int mdy = 0;
+	while (SDL_PollEvent(&e)) {
+		if (e.type == SDL_QUIT) G.exiting = 1;
+
+		struct push_key {
+			SDL_Keycode sym;
+			int* intptr;
+		} push_keys[] = {
+			{SDLK_w, &G.ctrl_forward},
+			{SDLK_s, &G.ctrl_backward},
+			{SDLK_a, &G.ctrl_left},
+			{SDLK_d, &G.ctrl_right},
+			{SDLK_SPACE, &G.ctrl_jump},
+			{-1, NULL}
+		};
+		for (struct push_key* tkp = push_keys; tkp->intptr != NULL; tkp++) {
+			if ((e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) && e.key.keysym.sym == tkp->sym) {
+				*(tkp->intptr) = (e.type == SDL_KEYDOWN);
+			}
+		}
+
+		if (e.type == SDL_KEYDOWN) {
+			if (e.key.keysym.sym == SDLK_ESCAPE) {
+				G.exiting = 1;
+			}
+		}
+
+		if (e.type == SDL_MOUSEMOTION) {
+			mdx += e.motion.xrel;
+			mdy += e.motion.yrel;
+		}
+	}
+
+	{
+		entity_apply_gravity(&G.player, GRAVITY_FORCE * G.dt);
+		G.player.ctrl_forward = G.ctrl_forward;
+		G.player.ctrl_backward = G.ctrl_backward;
+		G.player.ctrl_left = G.ctrl_left;
+		G.player.ctrl_right = G.ctrl_right;
+		G.player.ctrl_jump = G.ctrl_jump;
+		world_entity_clipmove(&G.world, &G.player, G.dt);
+		//vec3_dump(&G.player.velocity);
+	}
+
+	{
+		float sensitivity = 0.1f;
+		G.player.yaw += (float)mdx * sensitivity;
+		G.player.pitch += (float)mdy * sensitivity;
+		float pitch_limit = 90;
+		if (G.player.pitch > pitch_limit) G.player.pitch = pitch_limit;
+		if (G.player.pitch < -pitch_limit) G.player.pitch = -pitch_limit;
+	}
+
+#if 0 // fly-code
+	{
+		float speed = 0.1f;
+		float forward = (float)(G.ctrl_forward - G.ctrl_backward) * speed;
+		float right = (float)(G.ctrl_right - G.ctrl_left) * speed;
+		struct vec3 movement;
+		vec3_move(&movement, yaw, pitch, forward, right);
+		vec3_add_inplace(&position, &movement);
+	}
+#endif
+
+	struct mat44 view;
+	mat44_set_identity(&view);
+	mat44_rotate_x(&view, G.player.pitch);
+	mat44_rotate_y(&view, G.player.yaw);
+
+	struct vec3 translate;
+	vec3_scale(&translate, &G.player.position, -1);
+	mat44_translate(&view, &translate);
+
+	if (G.player.on_ground) {
+		glClearColor(0.6, 0.0, 0.2, 1.0);
+	} else {
+		glClearColor(0.0, 0.0, 0.2, 1.0);
+	}
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+	world_draw(&G.world, &G.render, &view);
+
+	SDL_GL_SwapWindow(G.window);
+}
+
 int main(int argc, char** argv)
 {
 	SAZ(SDL_Init(SDL_INIT_VIDEO));
 	atexit(SDL_Quit);
 
 	int bitmask = SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL;
-	SDL_Window* window = SDL_CreateWindow(
+	G.window = SDL_CreateWindow(
 			"??? ???",
 			SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-			0, 0,
+			192*5, 108*5,
 			bitmask);
 
-	SAN(window);
+	SAN(G.window);
 
-	SDL_GLContext glctx = SDL_GL_CreateContext(window);
+	SDL_GLContext glctx = SDL_GL_CreateContext(G.window);
 	SAN(glctx);
 
-	SAZ(SDL_GL_SetSwapInterval(1)); // or -1, "late swap tearing"?
+	//SAZ(SDL_GL_SetSwapInterval(1)); // or -1, "late swap tearing"?
 
 	glew_init();
 
-	struct render render;
-	render_init(&render, window);
+	render_init(&G.render, G.window);
 
-	struct world world;
-	world_init(&world);
+	world_init(&G.world);
 
-	int ctrl_forward = 0;
-	int ctrl_backward = 0;
-	int ctrl_left = 0;
-	int ctrl_right = 0;
-	int ctrl_jump = 0;
-
-	struct entity player;
-	entity_init(&player);
+	entity_init(&G.player);
 	{
 		struct vec3 ppos = {{4.5,20,3.5}};
-		player.position = ppos;
+		G.player.position = ppos;
 	}
 
 	glEnable(GL_DEPTH_TEST);
 	glEnable(GL_CULL_FACE);
 
-	float dt = 1.0 / 60.0;
+	G.dt = 1.0 / 60.0; // XXX assumption
 
 	SDL_SetRelativeMouseMode(SDL_TRUE);
-	int exiting = 0;
-	while (!exiting) {
-		SDL_Event e;
-		int mdx = 0;
-		int mdy = 0;
-		while (SDL_PollEvent(&e)) {
-			 if (e.type == SDL_QUIT) exiting = 1;
 
-			 struct push_key {
-				 SDL_Keycode sym;
-				 int* intptr;
-			 } push_keys[] = {
-				 {SDLK_w, &ctrl_forward},
-				 {SDLK_s, &ctrl_backward},
-				 {SDLK_a, &ctrl_left},
-				 {SDLK_d, &ctrl_right},
-				 {SDLK_SPACE, &ctrl_jump},
-				 {-1, NULL}
-			 };
-			 for (struct push_key* tkp = push_keys; tkp->intptr != NULL; tkp++) {
-				 if ((e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) && e.key.keysym.sym == tkp->sym) {
-					 *(tkp->intptr) = (e.type == SDL_KEYDOWN);
-				 }
-			 }
+	G.exiting = 0;
 
-			 if (e.type == SDL_KEYDOWN) {
-				 if (e.key.keysym.sym == SDLK_ESCAPE) {
-					 exiting = 1;
-				 }
-			 }
+	#ifdef __EMSCRIPTEN__
+	emscripten_set_main_loop(one_frame, 0, 1);
+	#else
+	while (!G.exiting) G.exiting |= one_frame();
+	#endif
 
-			 if (e.type == SDL_MOUSEMOTION) {
-				 mdx += e.motion.xrel;
-				 mdy += e.motion.yrel;
-			 }
-		}
-
-		{
-			entity_apply_gravity(&player, GRAVITY_FORCE * dt);
-			player.ctrl_forward = ctrl_forward;
-			player.ctrl_backward = ctrl_backward;
-			player.ctrl_left = ctrl_left;
-			player.ctrl_right = ctrl_right;
-			player.ctrl_jump = ctrl_jump;
-			world_entity_clipmove(&world, &player, dt);
-			//vec3_dump(&player.velocity);
-		}
-
-		{
-			float sensitivity = 0.1f;
-			player.yaw += (float)mdx * sensitivity;
-			player.pitch += (float)mdy * sensitivity;
-			float pitch_limit = 90;
-			if (player.pitch > pitch_limit) player.pitch = pitch_limit;
-			if (player.pitch < -pitch_limit) player.pitch = -pitch_limit;
-		}
-
-		#if 0 // fly-code
-		{
-			float speed = 0.1f;
-			float forward = (float)(ctrl_forward - ctrl_backward) * speed;
-			float right = (float)(ctrl_right - ctrl_left) * speed;
-			struct vec3 movement;
-			vec3_move(&movement, yaw, pitch, forward, right);
-			vec3_add_inplace(&position, &movement);
-		}
-		#endif
-
-		struct mat44 view;
-		mat44_set_identity(&view);
-		mat44_rotate_x(&view, player.pitch);
-		mat44_rotate_y(&view, player.yaw);
-
-		struct vec3 translate;
-		vec3_scale(&translate, &player.position, -1);
-		mat44_translate(&view, &translate);
-
-		if (player.on_ground) {
-			glClearColor(0.6, 0.0, 0.2, 1.0);
-		} else {
-			glClearColor(0.0, 0.0, 0.2, 1.0);
-		}
-		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-		world_draw(&world, &render, &view);
-
-		SDL_GL_SwapWindow(window);
-	}
-
-	SDL_DestroyWindow(window);
+	SDL_DestroyWindow(G.window);
 	SDL_GL_DeleteContext(glctx);
 
 	return EXIT_SUCCESS;
